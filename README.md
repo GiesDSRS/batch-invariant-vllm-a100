@@ -1,6 +1,6 @@
 # Batch Invariant vLLM for openai/gpt-oss-120b in nvidia A100 GPUs
 
-This repo contains all the code for a bitwise-reproducible, batch-invariant `openai/gpt-oss-120b` on a **single A100 80GB (sm80)** served vLLM with the faster marlin kernels (as compared to the MoE XXXX...)
+This repo contains all the code for a bitwise-reproducible, batch-invariant `openai/gpt-oss-120b` on a **single A100 80GB (sm80)**, served with vLLM on the Marlin MXFP4 MoE kernel. That kernel is 5.2x faster than the emulation backend, which is the only one vLLM leaves you on sm80 under `VLLM_BATCH_INVARIANT=1`.
 
 The most important thing in this repo:
 
@@ -22,7 +22,7 @@ The most important thing in this repo:
 
 ## Serve
 
-With an image that has vLLM's batch-invariant Marlin MoE kernel compiled for sm80 (see [image/](image/README.md), you likely have to build it, as it is not in any released vLLM at the time of writing), run:
+Needs an image carrying the batch-invariant Marlin MoE kernel built for sm80. No released vLLM ships it, so you have to build it: see [image/](image/README.md). Then run:
 
 ```Shell
 VLLM_BATCH_INVARIANT=1 \
@@ -97,11 +97,11 @@ We sent the async-scheduling fix to vLLM: [vllm-project/vllm#51287](https://gith
 The batch-invariant Marlin MoE kernel is **[vLLM PR #46639](https://github.com/vllm-project/vllm/pull/46639), authored upstream (not by us)**, but used as a stepping stone. This repo adds:
 
 1. compiling it for **sm80** against vLLM **v0.23.0** (the PR targets `csrc/libtorch_stable/moe/`; v0.23.0 has `csrc/moe/`),
-2. `block_size_m = 16` instead of the PR's 64, bitwise-identical output, measured faster ([why](image/README.md#block_size_m)),
+2. `block_size_m = 16` instead of the PR's 64, bitwise-identical output, measured faster ([why](image/README.md#patchesblock_size_m-16diff)),
 3. the serving configuration around it, above all: `--no-async-scheduling`.
 
 
-**Hopefully: If PR #46639 merges, most of this repo becomes unnecessary** ...; Released vLLM images already ship compiled kernels for every architecture, so you would just install vLLM and pass something like `--moe-backend=marlin`. Worth checking the PR before building.
+**If PR #46639 merges, most of this repo becomes unnecessary.** Released vLLM images ship compiled kernels for every architecture, so you would just install vLLM and pass `--moe-backend=marlin`. Worth checking the PR before building anything.
 
 
 
