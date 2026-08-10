@@ -1,0 +1,387 @@
+diff --git a/.buildkite/test_areas/misc.yaml b/.buildkite/test_areas/misc.yaml
+index 13840c8db2fc..78c8f0ea4a4d 100644
+--- a/.buildkite/test_areas/misc.yaml
++++ b/.buildkite/test_areas/misc.yaml
+@@ -406,6 +406,7 @@ steps:
+     - pip install pytest-timeout pytest-forked
+     - pytest -v -s v1/determinism/test_batch_invariance.py
+     - pytest -v -s v1/determinism/test_rms_norm_batch_invariant.py
++    - pytest -v -s v1/determinism/test_marlin_moe_batch_invariant.py
+     - VLLM_TEST_MODEL=deepseek-ai/DeepSeek-V2-Lite-Chat pytest -v -s v1/determinism/test_batch_invariance.py::test_v1_generation_is_deterministic_across_batch_sizes_with_needle[TRITON_MLA]
+     - VLLM_TEST_MODEL=Qwen/Qwen3-30B-A3B-Thinking-2507-FP8 pytest -v -s v1/determinism/test_batch_invariance.py::test_v1_generation_is_deterministic_across_batch_sizes_with_needle[FLASH_ATTN]
+ 
+@@ -422,6 +423,7 @@ steps:
+     - pip install pytest-timeout pytest-forked
+     - pytest -v -s v1/determinism/test_batch_invariance.py
+     - pytest -v -s v1/determinism/test_rms_norm_batch_invariant.py
++    - pytest -v -s v1/determinism/test_marlin_moe_batch_invariant.py
+     - VLLM_TEST_MODEL=deepseek-ai/DeepSeek-V2-Lite-Chat pytest -v -s v1/determinism/test_batch_invariance.py::test_v1_generation_is_deterministic_across_batch_sizes_with_needle[TRITON_MLA]
+     - VLLM_TEST_MODEL=Qwen/Qwen3-30B-A3B-Thinking-2507-FP8 pytest -v -s v1/determinism/test_batch_invariance.py::test_v1_generation_is_deterministic_across_batch_sizes_with_needle[FLASH_ATTN]
+     - pytest -v -s v1/determinism/test_nvfp4_batch_invariant.py
+diff --git a/csrc/libtorch_stable/moe/marlin_moe_wna16/kernel.h b/csrc/libtorch_stable/moe/marlin_moe_wna16/kernel.h
+index 783736ab5092..af0d35e222f2 100644
+--- a/csrc/libtorch_stable/moe/marlin_moe_wna16/kernel.h
++++ b/csrc/libtorch_stable/moe/marlin_moe_wna16/kernel.h
+@@ -21,7 +21,7 @@
+       const float *__restrict__ topk_weights_ptr, int top_k,          \
+       bool mul_topk_weights, int num_groups, int prob_m, int prob_n,  \
+       int prob_k, int *locks, bool has_bias, bool use_atomic_add,     \
+-      bool use_fp32_reduce
++      bool use_fp32_reduce, bool use_full_k
+ 
+ namespace MARLIN_NAMESPACE_NAME {
+ template <const vllm::ScalarTypeId a_type_id,  // A ScalarType id
+diff --git a/csrc/libtorch_stable/moe/marlin_moe_wna16/marlin_template.h b/csrc/libtorch_stable/moe/marlin_moe_wna16/marlin_template.h
+index 04f90101be4f..328c8f7ef53c 100644
+--- a/csrc/libtorch_stable/moe/marlin_moe_wna16/marlin_template.h
++++ b/csrc/libtorch_stable/moe/marlin_moe_wna16/marlin_template.h
+@@ -77,7 +77,8 @@ __global__ void Marlin(
+     int prob_k,             // reduction dimension k
+     int* locks,             // extra global storage for barrier synchronization
+     bool use_atomic_add,    // whether to use atomic add to reduce
+-    bool use_fp32_reduce    // whether to use fp32 global reduce
++    bool use_fp32_reduce,   // whether to use fp32 global reduce
++    bool use_full_k         // whether to use full-K reduction per block
+ ) {}
+ 
+ }  // namespace MARLIN_NAMESPACE_NAME
+@@ -278,8 +279,9 @@ __global__ void Marlin(
+     int prob_k,             // reduction dimension k
+     int* locks,             // extra global storage for barrier synchronization
+     bool has_bias,
+-    bool use_atomic_add,  // whether to use atomic add to reduce
+-    bool use_fp32_reduce  // whether to use fp32 global reduce
++    bool use_atomic_add,   // whether to use atomic add to reduce
++    bool use_fp32_reduce,  // whether to use fp32 global reduce
++    bool use_full_k        // whether to use full-K reduction per block
+ ) {
+   // Each threadblock processes one "stripe" of the B matrix with (roughly) the
+   // same size, which might involve multiple column "slices" (of width 16 *
+@@ -399,11 +401,12 @@ __global__ void Marlin(
+   // see https://github.com/vllm-project/vllm/pull/24722 for more details
+   if (global_mn_tiles > gridDim.x) {
+     part2_mn_tiles = global_mn_tiles % gridDim.x;
+-    if (part2_mn_tiles * 3 <= gridDim.x) part2_mn_tiles += gridDim.x;
++    if (!use_full_k && part2_mn_tiles * 3 <= gridDim.x)
++      part2_mn_tiles += gridDim.x;
+     part1_mn_iters = (global_mn_tiles - part2_mn_tiles) / gridDim.x;
+   }
+-
+-  int iters = div_ceil(k_tiles * part2_mn_tiles, gridDim.x);
++  int iters =
++      use_full_k ? k_tiles : div_ceil(k_tiles * part2_mn_tiles, gridDim.x);
+ 
+   if constexpr (!has_act_order && group_blocks != -1) {
+     if (group_blocks >= thread_k_blocks) {
+diff --git a/csrc/libtorch_stable/moe/marlin_moe_wna16/ops.cu b/csrc/libtorch_stable/moe/marlin_moe_wna16/ops.cu
+index 177eefa2c6f0..000defc1c683 100644
+--- a/csrc/libtorch_stable/moe/marlin_moe_wna16/ops.cu
++++ b/csrc/libtorch_stable/moe/marlin_moe_wna16/ops.cu
+@@ -33,6 +33,7 @@
+ #include <torch/headeronly/util/Exception.h>
+ 
+ #include "libtorch_stable/torch_utils.h"
++#include "core/batch_invariant.hpp"
+ 
+ #define STATIC_ASSERT_SCALAR_TYPE_VALID(scalar_t)               \
+   static_assert(std::is_same<scalar_t, half>::value ||          \
+@@ -277,7 +278,7 @@ exec_config_t determine_exec_config(
+     int prob_n, int prob_k, int num_experts, int top_k, int thread_m_blocks,
+     bool m_block_size_8, int num_bits, int group_size, bool has_act_order,
+     bool is_k_full, bool has_zp, bool is_zp_float, bool is_a_8bit, int stages,
+-    int max_shared_mem, int sms) {
++    int max_shared_mem, int sms, bool batch_invariant_launch) {
+   exec_config_t exec_cfg = exec_config_t{1, thread_config_t{-1, -1, -1}};
+   thread_config_t* thread_configs = thread_m_blocks > 1
+                                         ? large_batch_thread_configs
+@@ -327,7 +328,8 @@ exec_config_t determine_exec_config(
+     else
+       allow_count = max(min(allow_count, 2), 1);
+ 
+-    if (prob_n / th_config.thread_n * prob_m * top_k * 4 < sms * allow_count) {
++    if (!batch_invariant_launch &&
++        prob_n / th_config.thread_n * prob_m * top_k * 4 < sms * allow_count) {
+       allow_count =
+           max(prob_n / th_config.thread_n * prob_m * top_k * 4 / sms, 1);
+     }
+@@ -354,6 +356,7 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
+                int group_size, int dev, cudaStream_t stream, int thread_k,
+                int thread_n, int sms, int blocks_per_sm, bool use_atomic_add,
+                bool use_fp32_reduce, bool is_zp_float) {
++  bool batch_invariant_launch = vllm::vllm_is_batch_invariant();
+   int thread_m_blocks = div_ceil(moe_block_size, 16);
+   bool m_block_size_8 = moe_block_size == 8;
+   bool is_a_8bit = a_type.size_bits() == 8;
+@@ -478,7 +481,7 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
+         a_type, b_type, c_type, s_type, prob_m, prob_n, prob_k, num_experts,
+         top_k, thread_m_blocks, m_block_size_8, num_bits, group_size,
+         has_act_order, is_k_full, has_zp, is_zp_float, is_a_8bit, stages,
+-        max_shared_mem, sms);
++        max_shared_mem, sms, batch_invariant_launch);
+     thread_tfg = exec_cfg.tb_cfg;
+   }
+ 
+@@ -534,7 +537,8 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
+       A_ptr, B_ptr, C_ptr, C_tmp_ptr, bias_ptr, a_s_ptr, b_s_ptr, g_s_ptr, zp_ptr, g_idx_ptr,
+       sorted_token_ids_ptr, expert_ids_ptr, num_tokens_past_padded_ptr,
+       topk_weights_ptr, top_k, mul_topk_weights, num_groups, prob_m,
+-      prob_n, prob_k, locks, has_bias, use_atomic_add, use_fp32_reduce);
++      prob_n, prob_k, locks, has_bias, use_atomic_add, use_fp32_reduce,
++      batch_invariant_launch);
+   // clang-format on
+ }
+ 
+diff --git a/tests/v1/determinism/test_marlin_moe_batch_invariant.py b/tests/v1/determinism/test_marlin_moe_batch_invariant.py
+new file mode 100644
+index 000000000000..3864eeffa14e
+--- /dev/null
++++ b/tests/v1/determinism/test_marlin_moe_batch_invariant.py
+@@ -0,0 +1,179 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Batch invariance tests for the WNA16 Marlin MoE GEMM.
++
++``moe_wna16_marlin_gemm`` is shared by all Marlin MoE schemes (AWQ-INT4,
++GPTQ-INT4/INT8, MXFP4), so its batch-invariant path is exercised across schemes
++by calling ``fused_marlin_moe`` directly.
++"""
++
++from dataclasses import dataclass
++
++import pytest
++import torch
++from utils import skip_unsupported
++
++import vllm.envs as envs
++from tests.kernels.utils import torch_experts
++from vllm.config import VllmConfig, set_current_vllm_config
++from vllm.model_executor.layers.fused_moe import fused_topk
++from vllm.model_executor.layers.fused_moe.experts.marlin_moe import fused_marlin_moe
++from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
++    rand_marlin_weight_mxfp4_like,
++)
++from vllm.model_executor.layers.quantization.utils.marlin_utils_test import (
++    awq_marlin_quantize,
++    marlin_quantize,
++)
++from vllm.scalar_type import ScalarType, scalar_types
++
++
++@dataclass(frozen=True)
++class Scheme:
++    name: str
++    b_type: ScalarType
++    group_size: int
++    dtype: torch.dtype
++    ref_atol: float
++
++
++SCHEMES: list[Scheme] = [
++    Scheme("awq_int4", scalar_types.uint4, 128, torch.float16, 4e-2),
++    Scheme("gptq_int4", scalar_types.uint4b8, 128, torch.float16, 4e-2),
++    Scheme("gptq_int8", scalar_types.uint8b128, 128, torch.float16, 4e-2),
++    Scheme("mxfp4", scalar_types.float4_e2m1f, 32, torch.bfloat16, 1e-1),
++]
++
++
++def _stack(tensors: list[torch.Tensor]) -> torch.Tensor:
++    return torch.stack(tensors, dim=0)
++
++
++def _quantize_experts(
++    w: torch.Tensor, quant_type: ScalarType, group_size: int
++) -> dict[str, torch.Tensor | None]:
++    """Quantize per-expert weights into Marlin layout (see
++    ``MarlinMoEWeightData.make`` in ``tests/kernels/moe/test_moe.py``)."""
++    has_zp = quant_type in (scalar_types.uint4, scalar_types.uint8)
++    k = w.shape[-1]
++
++    w_ref_l: list[torch.Tensor] = []
++    qweight_l: list[torch.Tensor] = []
++    scales_l: list[torch.Tensor] = []
++    zeros_l: list[torch.Tensor] = []
++    g_idx_l: list[torch.Tensor] = []
++    sort_l: list[torch.Tensor] = []
++
++    for i in range(w.shape[0]):
++        if quant_type == scalar_types.float4_e2m1f:
++            w_ref, qweight, scales = rand_marlin_weight_mxfp4_like(w[i], group_size)
++            qweight_l.append(qweight)
++            scales_l.append(scales)
++        elif has_zp:
++            w_ref, qweight, scales, zeros = awq_marlin_quantize(
++                w[i].transpose(1, 0), quant_type, group_size
++            )
++            qweight_l.append(qweight)
++            scales_l.append(scales)
++            zeros_l.append(zeros)
++        else:
++            test_perm = torch.randperm(k)
++            w_ref, qweight, scales, g_idx, sort_indices, _ = marlin_quantize(
++                w[i].transpose(1, 0), quant_type, group_size, False, test_perm
++            )
++            qweight_l.append(qweight)
++            scales_l.append(scales)
++            g_idx_l.append(g_idx)
++            sort_l.append(sort_indices)
++        w_ref_l.append(w_ref.T)
++
++    return {
++        "w_ref": _stack(w_ref_l),
++        "qweight": _stack(qweight_l).contiguous(),
++        "scales": _stack(scales_l),
++        "zeros": _stack(zeros_l) if zeros_l else None,
++        "g_idx": _stack(g_idx_l) if g_idx_l else None,
++        "sort_indices": _stack(sort_l) if sort_l else None,
++    }
++
++
++# (n, k) shapes mirror the small/large matrices in MARLIN_MOE_SCENARIOS
++# (tests/kernels/moe/test_moe.py). The large shape exercises the multi-tile
++# K reduction that the batch-invariant ``use_full_k`` path pins.
++SHAPES: list[tuple[int, int]] = [(512, 512), (1024, 2048)]
++
++
++@skip_unsupported
++@pytest.mark.parametrize("scheme", SCHEMES, ids=[s.name for s in SCHEMES])
++@pytest.mark.parametrize("n,k", SHAPES, ids=["small", "large"])
++@pytest.mark.parametrize("batch_size", [4, 16, 64, 257])
++def test_marlin_moe_kernel_is_batch_invariant(
++    scheme: Scheme, n: int, k: int, batch_size: int
++):
++    """A token's Marlin MoE output is bitwise identical regardless of batch
++    size or its position in the batch, and matches a dequantized reference."""
++    assert envs.VLLM_BATCH_INVARIANT
++
++    torch.manual_seed(0)
++    e, topk = 8, 2
++    dtype = scheme.dtype
++
++    w1 = torch.randn((e, 2 * n, k), device="cuda", dtype=dtype) / 10
++    w2 = torch.randn((e, k, n), device="cuda", dtype=dtype) / 10
++    w1q = _quantize_experts(w1, scheme.b_type, scheme.group_size)
++    w2q = _quantize_experts(w2, scheme.b_type, scheme.group_size)
++
++    token = torch.randn((1, k), device="cuda", dtype=dtype) / 10
++    token_score = torch.randn((1, e), device="cuda", dtype=dtype)
++
++    def run(a: torch.Tensor, score: torch.Tensor) -> torch.Tensor:
++        topk_weights, topk_ids, _ = fused_topk(a, score, topk, False)
++        return fused_marlin_moe(
++            a,
++            w1q["qweight"],
++            w2q["qweight"],
++            None,
++            None,
++            w1q["scales"],
++            w2q["scales"],
++            topk_weights,
++            topk_ids,
++            quant_type_id=scheme.b_type.id,
++            global_num_experts=e,
++            g_idx1=w1q["g_idx"],
++            g_idx2=w2q["g_idx"],
++            sort_indices1=w1q["sort_indices"],
++            sort_indices2=w2q["sort_indices"],
++            w1_zeros=w1q["zeros"],
++            w2_zeros=w2q["zeros"],
++            input_dtype=dtype,
++            is_k_full=True,
++        )
++
++    with set_current_vllm_config(VllmConfig()):
++        baseline = run(token, token_score)[0]
++        ref_weights, ref_ids, _ = fused_topk(token, token_score, topk, False)
++        ref = torch_experts(
++            token,
++            w1q["w_ref"],
++            w2q["w_ref"],
++            topk_weight=ref_weights,
++            topk_ids=ref_ids,
++            global_num_experts=e,
++        )
++        torch.testing.assert_close(baseline, ref[0], rtol=0.0, atol=scheme.ref_atol)
++
++        filler_a = torch.randn((batch_size - 1, k), device="cuda", dtype=dtype) / 10
++        filler_score = torch.randn((batch_size - 1, e), device="cuda", dtype=dtype)
++
++        front = run(
++            torch.cat([token, filler_a], dim=0),
++            torch.cat([token_score, filler_score], dim=0),
++        )[0]
++        back = run(
++            torch.cat([filler_a, token], dim=0),
++            torch.cat([filler_score, token_score], dim=0),
++        )[-1]
++
++    torch.testing.assert_close(front, baseline, rtol=0.0, atol=0.0)
++    torch.testing.assert_close(back, baseline, rtol=0.0, atol=0.0)
+diff --git a/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py b/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py
+index 17c166961397..67b0d5ab98c7 100644
+--- a/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py
++++ b/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py
+@@ -8,6 +8,7 @@
+ import torch
+ 
+ import vllm._custom_ops as ops
++import vllm.envs as envs
+ import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+ from vllm.model_executor.layers.fused_moe.activation import (
+     MoEActivation,
+@@ -319,11 +320,15 @@ def fused_marlin_moe(
+         # Set M to estimated valid tokens per rank
+         M = math.ceil(M * E / global_num_experts)
+ 
+-    # M block size selection logic
+-    # TODO: tune this further for specific models
+-    for block_size_m in [8, 16, 32, 48, 64]:
+-        if M * topk / E / block_size_m < 0.9:
+-            break
++    if envs.VLLM_BATCH_INVARIANT:
++        # Pin block_size_m so token alignment is independent of M.
++        block_size_m = 64
++    else:
++        # M block size selection logic
++        # TODO: tune this further for specific models
++        for block_size_m in [8, 16, 32, 48, 64]:
++            if M * topk / E / block_size_m < 0.9:
++                break
+ 
+     if input_dtype is not None and input_dtype.itemsize == 1:
+         block_size_m = max(block_size_m, 16)
+@@ -489,13 +494,17 @@ def batched_fused_marlin_moe(
+     # [B * MAX_TOKENS, K] and top_k can be interpreted as just 1.
+     topk = 1
+ 
+-    # TODO(varun) : Choose a decent block size like in fused_marlin_moe
+-    # Tune block_size_m based on expert capacity to reduce padding overhead.
+-    block_size_m = 64
+-    for b_m in [8, 16, 32, 48, 64]:
+-        if BATCH_TOKENS_MAX / b_m < 0.9:
+-            block_size_m = b_m
+-            break
++    if envs.VLLM_BATCH_INVARIANT:
++        # Pin block_size_m so token alignment is independent of M.
++        block_size_m = 64
++    else:
++        # TODO(varun) : Choose a decent block size like in fused_marlin_moe
++        # Tune block_size_m based on expert capacity to reduce padding overhead.
++        block_size_m = 64
++        for b_m in [8, 16, 32, 48, 64]:
++            if BATCH_TOKENS_MAX / b_m < 0.9:
++                block_size_m = b_m
++                break
+ 
+     if input_dtype is not None and input_dtype.itemsize == 1:
+         block_size_m = max(block_size_m, 16)
+@@ -607,6 +616,10 @@ def _supports_current_device() -> bool:
+         p = current_platform
+         return p.is_cuda() and p.has_device_capability((7, 5))
+ 
++    @staticmethod
++    def _supports_batch_invariance() -> bool:
++        return True
++
+     @staticmethod
+     def _supports_no_act_and_mul() -> bool:
+         return True

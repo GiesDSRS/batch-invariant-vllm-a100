@@ -1,0 +1,34 @@
+Our delta on top of vLLM PR #46639: pin the Marlin m-block to 16 instead of 64
+under VLLM_BATCH_INVARIANT.
+
+Apply AFTER pr46639.diff. Output is bitwise identical to the PR's 64 -- block_size_m
+tiles the TOKEN dimension, while each row's K-reduction order is set by BLOCK_K, so
+per-row arithmetic is unchanged. It is faster because 16 exactly matches one Marlin
+m-block (thread_m_blocks = div_ceil(16, 16) = 1), so decode stops padding ~92 real
+token-expert rows out to ~4,200 MMA rows.
+
+Measured on 100 long documents: 1x100 334s vs 345s, 10x10 508s vs 598s (1.18x).
+
+Do NOT use 8: div_ceil(8, 16) is also 1, so it selects the SAME kernel and merely
+creates half-empty blocks. 32 (thread_m_blocks = 2) is the only other sensible value.
+
+--- a/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py
++++ b/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py
+@@ -320,7 +320,7 @@
+
+     if envs.VLLM_BATCH_INVARIANT:
+         # Pin block_size_m so token alignment is independent of M.
+-        block_size_m = 64
++        block_size_m = 16
+     else:
+         # M block size selection logic
+         # TODO: tune this further for specific models
+@@ -491,7 +491,7 @@
+
+     if envs.VLLM_BATCH_INVARIANT:
+         # Pin block_size_m so token alignment is independent of M.
+-        block_size_m = 64
++        block_size_m = 16
+     else:
+         # Tune block_size_m based on expert capacity to reduce padding overhead.
+         block_size_m = 64

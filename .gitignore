@@ -1,0 +1,17 @@
+# Build artifacts. The .so is ~25 MB and architecture-specific -- build it, don't
+# commit it. See image/README.md.
+*.so
+marlin_moe.py
+
+# Never commit workload data or results
+*.parquet
+*.jsonl
+hashes_*.json
+
+__pycache__/
+*.pyc
+.venv/
+.DS_Store
+
+# Internal working notes -- kept locally, never shared
+findings/

@@ -1,0 +1,33 @@
+# Pins for the client-side test only.
+#
+# Nothing here affects the server. What the GPU runs is fixed by the image
+# (image/) and the flags (serve/), not by this file. These are just the two
+# packages test/batch_invariance.py imports, pinned to the versions it was
+# run with.
+#
+#   pip install .          # or: uv sync
+#   BASE_URL=... API_KEY=... python test/batch_invariance.py
+
+[project]
+name = "batch-invariant-vllm-a100"
+version = "0.1.0"
+description = "Batch-invariant, bitwise-reproducible gpt-oss-120b on a single A100 80GB (sm80)"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.9"
+dependencies = [
+    "openai==2.48.0",
+    "tqdm==4.69.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/GiesDSRS/batch-invariant-vllm-a100"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+# There is no package to install, only scripts. This keeps `pip install .`
+# from hunting for one.
+[tool.setuptools]
+py-modules = []
