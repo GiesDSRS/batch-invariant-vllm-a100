@@ -7,6 +7,8 @@
 # `# ...` command substitutions, which expand to nothing.
 
 export VLLM_BATCH_INVARIANT=1
+# gpt-oss stamps the server date into every system prompt; pin it or outputs change by day.
+export VLLM_SYSTEM_START_DATE=2026-07-27
 
 exec vllm serve openai/gpt-oss-120b \
   `# ---- Correctness / determinism ----` \
